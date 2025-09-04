@@ -16,13 +16,14 @@
 // under the License.
 
 //! Regex expressions
-use arrow::array::{Array, ArrayRef, AsArray};
+use arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
 use arrow::compute::kernels::regexp;
 use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
+use datafusion_common::arrow_datafusion_err;
+use datafusion_common::cast::as_int64_array;
 use datafusion_common::exec_err;
 use datafusion_common::ScalarValue;
-use datafusion_common::{arrow_datafusion_err, plan_err};
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::{ColumnarValue, Documentation, TypeSignature};
 use datafusion_expr::{ScalarUDFImpl, Signature, Volatility};
@@ -151,79 +152,80 @@ impl ScalarUDFImpl for RegexpExtractFunc {
 pub fn regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
     match args.len() {
         3 => {
-            regexp::regexp_match(&args[0], &args[1], None)
-                .map_err(|e| arrow_datafusion_err!(e))
+            let mut res = StringBuilder::new();
+
+            let group_indices = as_int64_array(&args[2])?;
+
+            let results = regexp::regexp_match(&args[0], &args[1], None)
+                .map_err(|e| arrow_datafusion_err!(e))?;
+
+            for (match_groups, group_idx) in
+                results.as_list::<i32>().iter().zip(group_indices.iter())
+            {
+                match (match_groups, group_idx) {
+                    (Some(group), Some(idx)) if (idx as usize) < group.len() => {
+                        let v = group.as_string::<i32>().value(idx as usize);
+                        res.append_value(v);
+                    }
+                    _ => {
+                        res.append_null();
+                    }
+                }
+            }
+            let res = res.finish();
+            Ok(Arc::new(res))
         }
         other => exec_err!(
             "regexp_extract was called with {other} arguments. It requires exactly 3."
         ),
     }
 }
+
 #[cfg(test)]
 mod tests {
     use crate::regex::regexpextract::regexp_extract;
-    use arrow::array::StringArray;
-    use arrow::array::{GenericStringBuilder, ListBuilder};
+    use arrow::array::{Int64Array, StringArray, StringBuilder};
     use std::sync::Arc;
 
     #[test]
-    fn test_case_sensitive_regexp_match2() {
-        let values = StringArray::from(vec!["abc"; 5]);
+    fn test_groupidx_0() {
+        let values = StringArray::from(vec!["bd"; 5]);
         let patterns =
-            StringArray::from(vec!["^(a)", "^(A)", "(b|d)", "(B|D)", "^(b|c)"]);
+            StringArray::from(vec!["^(b)", "^(d)", "(b|d)(b|d)", "(B|D)", "^(b|c)"]);
+        let ids = Int64Array::from(vec![0; 5]);
 
-        let elem_builder: GenericStringBuilder<i32> = GenericStringBuilder::new();
-        let mut expected_builder = ListBuilder::new(elem_builder);
-        expected_builder.values().append_value("a");
-        expected_builder.append(true);
-        expected_builder.append(false);
-        expected_builder.values().append_value("b");
-        expected_builder.append(true);
-        expected_builder.append(false);
-        expected_builder.append(false);
+        let mut expected_builder = StringBuilder::new();
+        expected_builder.append_value("b");
+        expected_builder.append_null();
+        expected_builder.append_value("b");
+        expected_builder.append_null();
+        expected_builder.append_value("b");
         let expected = expected_builder.finish();
 
-        let re = regexp_match(&[Arc::new(values), Arc::new(patterns)]).unwrap();
-
-        assert_eq!(re.as_ref(), &expected);
-    }
-
-    #[test]
-    fn test_case_insensitive_regexp_match2() {
-        let values = StringArray::from(vec!["abc"; 5]);
-        let patterns =
-            StringArray::from(vec!["^(a)", "^(A)", "(b|d)", "(B|D)", "^(b|c)"]);
-        let flags = StringArray::from(vec!["i"; 5]);
-
-        let elem_builder: GenericStringBuilder<i32> = GenericStringBuilder::new();
-        let mut expected_builder = ListBuilder::new(elem_builder);
-        expected_builder.values().append_value("a");
-        expected_builder.append(true);
-        expected_builder.values().append_value("a");
-        expected_builder.append(true);
-        expected_builder.values().append_value("b");
-        expected_builder.append(true);
-        expected_builder.values().append_value("b");
-        expected_builder.append(true);
-        expected_builder.append(false);
-        let expected = expected_builder.finish();
-
-        let re = regexp_match(&[Arc::new(values), Arc::new(patterns), Arc::new(flags)])
+        let re = regexp_extract(&[Arc::new(values), Arc::new(patterns), Arc::new(ids)])
             .unwrap();
 
         assert_eq!(re.as_ref(), &expected);
     }
 
-    #[test] 
-    fn test_unsupported_global_flag_regexp_match2() {
-        let values = StringArray::from(vec!["abc"]);
-        let patterns = StringArray::from(vec!["^(a)"]);
-        let flags = StringArray::from(vec!["g"]);
+    #[test]
+    fn test_groupidx_1() {
+        let values = StringArray::from(vec!["bd"; 5]);
+        let patterns =
+            StringArray::from(vec!["^(b)", "^(d)", "(b|d)(b|d)", "(B|D)", "^(b|c)"]);
+        let ids = Int64Array::from(vec![1; 5]);
 
-        let re_err =
-            regexp_match(&[Arc::new(values), Arc::new(patterns), Arc::new(flags)])
-                .expect_err("unsupported flag should have failed");
+        let mut expected_builder = StringBuilder::new();
+        expected_builder.append_null();
+        expected_builder.append_null();
+        expected_builder.append_value("d");
+        expected_builder.append_null();
+        expected_builder.append_null();
+        let expected = expected_builder.finish();
 
-        assert_eq!(re_err.strip_backtrace(), "Error during planning: regexp_match() does not support the \"global\" option");
+        let re = regexp_extract(&[Arc::new(values), Arc::new(patterns), Arc::new(ids)])
+            .unwrap();
+
+        assert_eq!(re.as_ref(), &expected);
     }
 }
