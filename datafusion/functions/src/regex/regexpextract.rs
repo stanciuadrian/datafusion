@@ -16,14 +16,13 @@
 // under the License.
 
 //! Regex expressions
-use arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
+use arrow::array::{Array, ArrayRef, AsArray, StringViewBuilder};
 use arrow::compute::kernels::regexp;
 use arrow::datatypes::DataType;
-use arrow::datatypes::Field;
-use datafusion_common::arrow_datafusion_err;
 use datafusion_common::cast::as_int64_array;
 use datafusion_common::exec_err;
 use datafusion_common::ScalarValue;
+use datafusion_common::{arrow_datafusion_err, plan_err};
 use datafusion_common::{DataFusionError, Result};
 use datafusion_expr::{ColumnarValue, Documentation, TypeSignature};
 use datafusion_expr::{ScalarUDFImpl, Signature, Volatility};
@@ -107,11 +106,10 @@ impl ScalarUDFImpl for RegexpExtractFunc {
         &self.signature
     }
 
-    // like regexp_match
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
         Ok(match &arg_types[0] {
             DataType::Null => DataType::Null,
-            other => DataType::List(Arc::new(Field::new_list_field(other.clone(), true))),
+            other => other.clone(),
         })
     }
 
@@ -152,9 +150,9 @@ impl ScalarUDFImpl for RegexpExtractFunc {
 pub fn regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
     match args.len() {
         3 => {
-            let mut res = StringBuilder::new();
-
             let group_indices = as_int64_array(&args[2])?;
+
+            let mut res = StringViewBuilder::with_capacity(group_indices.len());
 
             let results = regexp::regexp_match(&args[0], &args[1], None)
                 .map_err(|e| arrow_datafusion_err!(e))?;
@@ -164,8 +162,21 @@ pub fn regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
             {
                 match (match_groups, group_idx) {
                     (Some(group), Some(idx)) if (idx as usize) < group.len() => {
-                        let v = group.as_string::<i32>().value(idx as usize);
-                        res.append_value(v);
+                        let group = match group.data_type() {
+                            DataType::Utf8View => {
+                                group.as_string_view().value(idx as usize)
+                            }
+                            DataType::Utf8 => {
+                                group.as_string::<i32>().value(idx as usize)
+                            }
+                            DataType::LargeUtf8 => {
+                                group.as_string::<i64>().value(idx as usize)
+                            }
+                            e => {
+                                return plan_err!("regexp_extract was called with unexpected data type {e:?}");
+                            }
+                        };
+                        res.append_value(group);
                     }
                     _ => {
                         res.append_null();
@@ -184,7 +195,7 @@ pub fn regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
 #[cfg(test)]
 mod tests {
     use crate::regex::regexpextract::regexp_extract;
-    use arrow::array::{Int64Array, StringArray, StringBuilder};
+    use arrow::array::{Int64Array, StringArray, StringViewBuilder};
     use std::sync::Arc;
 
     #[test]
@@ -194,7 +205,7 @@ mod tests {
             StringArray::from(vec!["^(b)", "^(d)", "(b|d)(b|d)", "(B|D)", "^(b|c)"]);
         let ids = Int64Array::from(vec![0; 5]);
 
-        let mut expected_builder = StringBuilder::new();
+        let mut expected_builder = StringViewBuilder::new();
         expected_builder.append_value("b");
         expected_builder.append_null();
         expected_builder.append_value("b");
@@ -215,7 +226,7 @@ mod tests {
             StringArray::from(vec!["^(b)", "^(d)", "(b|d)(b|d)", "(B|D)", "^(b|c)"]);
         let ids = Int64Array::from(vec![1; 5]);
 
-        let mut expected_builder = StringBuilder::new();
+        let mut expected_builder = StringViewBuilder::new();
         expected_builder.append_null();
         expected_builder.append_null();
         expected_builder.append_value("d");
