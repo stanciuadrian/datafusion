@@ -1797,6 +1797,7 @@ The following regular expression functions are supported:
 - [regexp_like](#regexp_like)
 - [regexp_match](#regexp_match)
 - [regexp_replace](#regexp_replace)
+- [regexp_extract](#regexp_extract)
 
 ### `regexp_count`
 
@@ -1979,6 +1980,40 @@ SELECT regexp_replace('aBc', '(b|d)', 'Ab\\1a', 'i');
 ```
 
 Additional examples can be found [here](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/regexp.rs)
+
+### `regexp_extract`
+
+Matches a [regular expression](https://docs.rs/regex/latest/regex/#syntax) against a string and extracts a specific match group.
+
+```sql
+regexp_extract(str, regexp, idx)
+```
+
+#### Arguments
+
+- **str**: String expression to operate on. Can be a constant, column, or function, and any combination of operators.
+- **regexp**: Regular expression to match against.
+  Can be a constant, column, or function.
+- **idx**: Group match index, 1-based.
+  Can be a constant, column, or function.
+
+#### Example
+
+```sql
+> select regexp_extract('bd', '(b|d)(b|d)', 1);
++--------------------------------------------------------+
+| regexp_extract(Utf8("bd"),Utf8("(b|d)(b|d)"),Int64(1)) |
++--------------------------------------------------------+
+| b                                                      |
++--------------------------------------------------------+
+
+> select regexp_extract('bd', '(b|d)(b|d)', 2);
++--------------------------------------------------------+
+| regexp_extract(Utf8("bd"),Utf8("(b|d)(b|d)"),Int64(2)) |
++--------------------------------------------------------+
+| d                                                      |
++--------------------------------------------------------+
+```
 
 ## Time and Date Functions
 

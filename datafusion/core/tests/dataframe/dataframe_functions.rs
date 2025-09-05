@@ -791,6 +791,46 @@ async fn test_fn_regexp_match() -> Result<()> {
 
 #[tokio::test]
 #[cfg(feature = "unicode_expressions")]
+async fn test_fn_regexp_extract() -> Result<()> {
+    let expr = regexp_extract(col("a"), lit("([a-z])([a-z])([a-z])"), lit(1));
+
+    let batches = get_batches(expr).await?;
+
+    assert_snapshot!(
+        batches_to_string(&batches),
+        @r#"
+    +---------------------------------------------------------------+
+    | regexp_extract(test.a,Utf8("([a-z])([a-z])([a-z])"),Int32(1)) |
+    +---------------------------------------------------------------+
+    | a                                                             |
+    | a                                                             |
+    | d                                                             |
+    |                                                               |
+    +---------------------------------------------------------------+
+    "#);
+
+    let expr = regexp_extract(col("a"), lit("([a-z])([a-z])([a-z])"), lit(2));
+
+    let batches = get_batches(expr).await?;
+
+    assert_snapshot!(
+        batches_to_string(&batches),
+        @r#"
+    +---------------------------------------------------------------+
+    | regexp_extract(test.a,Utf8("([a-z])([a-z])([a-z])"),Int32(2)) |
+    +---------------------------------------------------------------+
+    | b                                                             |
+    | b                                                             |
+    | e                                                             |
+    |                                                               |
+    +---------------------------------------------------------------+
+    "#);
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(feature = "unicode_expressions")]
 async fn test_fn_regexp_replace() -> Result<()> {
     let expr = regexp_replace(col("a"), lit("[a-z]"), lit("x"), Some(lit("g")));
 

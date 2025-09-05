@@ -32,21 +32,22 @@ use std::sync::Arc;
 
 #[user_doc(
     doc_section(label = "Regular Expression Functions"),
-    description = "Returns the first [regular expression](https://docs.rs/regex/latest/regex/#syntax) matches in a string.",
-    syntax_example = "regexp_extract(str, regexp, id)",
+    description = "Matches a regular expression against a string and extracts a specific match group.",
+    syntax_example = "regexp_extract(str, regexp, idx)",
     sql_example = r#"```sql
-            > select regexp_extract('Köln', '[a-zA-Z]ö[a-zA-Z]{2}');
-            +---------------------------------------------------------+
-            | regexp_extract(Utf8("Köln"),Utf8("[a-zA-Z]ö[a-zA-Z]{2}")) |
-            +---------------------------------------------------------+
-            | [Köln]                                                  |
-            +---------------------------------------------------------+
-            SELECT regexp_extract('aBc', '(b|d)', 'i');
-            +---------------------------------------------------+
-            | regexp_extract(Utf8("aBc"),Utf8("(b|d)"),Utf8("i")) |
-            +---------------------------------------------------+
-            | [B]                                               |
-            +---------------------------------------------------+
+            > select regexp_extract('bd', '(b|d)(b|d)', 1);
+            +--------------------------------------------------------+
+            | regexp_extract(Utf8("bd"),Utf8("(b|d)(b|d)"),Int64(1)) |
+            +--------------------------------------------------------+
+            | b                                                      |
+            +--------------------------------------------------------+
+
+            > select regexp_extract('bd', '(b|d)(b|d)', 2);
+            +--------------------------------------------------------+
+            | regexp_extract(Utf8("bd"),Utf8("(b|d)(b|d)"),Int64(2)) |
+            +--------------------------------------------------------+
+            | d                                                      |
+            +--------------------------------------------------------+
 ```
 Additional examples can be found [here](https://github.com/apache/datafusion/blob/main/datafusion-examples/examples/regexp.rs)
 "#,
@@ -57,13 +58,9 @@ Additional examples can be found [here](https://github.com/apache/datafusion/blo
             Can be a constant, column, or function."
     ),
     argument(
-        name = "id",
-        description = r#"Optional regular expression flags that control the behavior of the regular expression. The following flags are supported:
-  - **i**: case-insensitive: letters match both upper and lower case
-  - **m**: multi-line mode: ^ and $ match begin/end of line
-  - **s**: allow . to match \n
-  - **R**: enables CRLF mode: when multi-line mode is enabled, \r\n is used
-  - **U**: swap the meaning of x* and x*?"#
+        name = "idx",
+        description = "Group match index, 1-based.
+            Can be a constant, column, or function."
     )
 )]
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -83,6 +80,7 @@ impl RegexpExtractFunc {
         Self {
             signature: Signature::one_of(
                 vec![
+                    // Int64 and not UInt64 because idx=0 in SQL binds to Int64
                     TypeSignature::Exact(vec![Utf8View, Utf8View, Int64]),
                     TypeSignature::Exact(vec![Utf8, Utf8, Int64]),
                     TypeSignature::Exact(vec![LargeUtf8, LargeUtf8, Int64]),
@@ -117,7 +115,9 @@ impl ScalarUDFImpl for RegexpExtractFunc {
         &self,
         args: datafusion_expr::ScalarFunctionArgs,
     ) -> Result<ColumnarValue> {
+        // determine if dealing with scalar-only inputs or at least one array input
         let args = &args.args;
+        // len is None if all scalars, Some(len) if any array exists
         let len = args
             .iter()
             .fold(Option::<usize>::None, |acc, arg| match arg {
@@ -125,13 +125,18 @@ impl ScalarUDFImpl for RegexpExtractFunc {
                 ColumnarValue::Array(a) => Some(a.len()),
             });
 
+        // normalize inputs
         let is_scalar = len.is_none();
         let inferred_length = len.unwrap_or(1);
+        // broadcast scalars to inferred length (1 for scalar-only)
         let args = args
             .iter()
             .map(|arg| arg.to_array(inferred_length))
             .collect::<Result<Vec<_>>>()?;
 
+        // preserve input semantics
+        // scalar inputs -> scalar outputs
+        // array inputs -> array outputs
         let result = regexp_extract(&args);
         if is_scalar {
             // If all inputs are scalar, keeps output as scalar
@@ -157,33 +162,44 @@ pub fn regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
             let results = regexp::regexp_match(&args[0], &args[1], None)
                 .map_err(|e| arrow_datafusion_err!(e))?;
 
-            for (match_groups, group_idx) in
+            for (match_groups, idx_1based) in
                 results.as_list::<i32>().iter().zip(group_indices.iter())
             {
-                match (match_groups, group_idx) {
-                    (Some(group), Some(idx)) if (idx as usize) < group.len() => {
-                        let group = match group.data_type() {
-                            DataType::Utf8View => {
-                                group.as_string_view().value(idx as usize)
+                match (match_groups, idx_1based) {
+                    (Some(group), Some(idx)) => {
+                        let idx_0based: Result<usize, _> = (idx - 1).try_into();
+                        match idx_0based {
+                            Ok(idx_0based) if idx_0based < group.len() => {
+                                let group = match group.data_type() {
+                                    DataType::Utf8View => {
+                                        group.as_string_view().value(idx_0based)
+                                    }
+                                    DataType::Utf8 => {
+                                        group.as_string::<i32>().value(idx_0based)
+                                    }
+                                    DataType::LargeUtf8 => {
+                                        group.as_string::<i64>().value(idx_0based)
+                                    }
+                                    e => {
+                                        return plan_err!("regexp_extract was called with unexpected data type {e:?}");
+                                    }
+                                };
+                                res.append_value(group);
                             }
-                            DataType::Utf8 => {
-                                group.as_string::<i32>().value(idx as usize)
+                            _ => {
+                                // idx-1 doesn't map to usize or is out-of-bounds for the match result
+                                res.append_null();
                             }
-                            DataType::LargeUtf8 => {
-                                group.as_string::<i64>().value(idx as usize)
-                            }
-                            e => {
-                                return plan_err!("regexp_extract was called with unexpected data type {e:?}");
-                            }
-                        };
-                        res.append_value(group);
+                        }
                     }
                     _ => {
+                        // match result or result are missing (NULL)
                         res.append_null();
                     }
                 }
             }
             let res = res.finish();
+
             Ok(Arc::new(res))
         }
         other => exec_err!(
@@ -195,46 +211,51 @@ pub fn regexp_extract(args: &[ArrayRef]) -> Result<ArrayRef> {
 #[cfg(test)]
 mod tests {
     use crate::regex::regexpextract::regexp_extract;
-    use arrow::array::{Int64Array, StringArray, StringViewBuilder};
+    use arrow::array::{Int64Array, StringViewBuilder};
     use std::sync::Arc;
 
     #[test]
-    fn test_groupidx_0() {
-        let values = StringArray::from(vec!["bd"; 5]);
-        let patterns =
-            StringArray::from(vec!["^(b)", "^(d)", "(b|d)(b|d)", "(B|D)", "^(b|c)"]);
-        let ids = Int64Array::from(vec![0; 5]);
-
+    fn test_regexp_extract() {
+        let mut value_builder = StringViewBuilder::new();
+        let mut pattern_builder = StringViewBuilder::new();
+        let mut idx_builder = Vec::<Option<i64>>::new();
         let mut expected_builder = StringViewBuilder::new();
-        expected_builder.append_value("b");
-        expected_builder.append_null();
-        expected_builder.append_value("b");
-        expected_builder.append_null();
-        expected_builder.append_value("b");
+
+        let tests = vec![
+            // tuple format: input string, regex pattern, match group index, expected
+            // None is translated to missing (NULL)
+            (Some("bd"), Some("(b|d)(b|d)"), Some(1), Some("b")), // positive test: 2 matches, extract first group
+            (Some("bd"), Some("(b|d)(b|d)"), Some(2), Some("d")), // positive test: 2 matches, extract second group
+            (Some("bd"), Some("(b|d)(b|d)"), Some(3), None), // negative test: 2 matches, extract 3rd
+            (Some("bd"), Some("(b|d)(b|d)"), Some(0), None), // negative test: 2 matches, extract 0th for 1-based indexing
+            (Some("ae"), Some("(b|d)(b|d)"), Some(1), None), // negative test: 0 matches, extract 1st
+            (None, Some("(b|d)(b|d)"), Some(1), None), // negative test: missing input string
+            (Some("bd"), None, Some(1), None), // negative test: missing regex pattern
+            (Some("bd"), Some("(b|d)(b|d)"), None, None), // negative test: missing group idx
+        ];
+
+        for (value, pattern, idx, expected) in tests {
+            match value {
+                Some(value) => value_builder.append_value(value),
+                None => value_builder.append_null(),
+            }
+            match pattern {
+                Some(pattern) => pattern_builder.append_value(pattern),
+                None => pattern_builder.append_null(),
+            }
+            idx_builder.push(idx);
+            match expected {
+                Some(expected) => expected_builder.append_value(expected),
+                None => expected_builder.append_null(),
+            }
+        }
+
+        let values = value_builder.finish();
+        let patterns = pattern_builder.finish();
+        let idx = Int64Array::from(idx_builder);
         let expected = expected_builder.finish();
 
-        let re = regexp_extract(&[Arc::new(values), Arc::new(patterns), Arc::new(ids)])
-            .unwrap();
-
-        assert_eq!(re.as_ref(), &expected);
-    }
-
-    #[test]
-    fn test_groupidx_1() {
-        let values = StringArray::from(vec!["bd"; 5]);
-        let patterns =
-            StringArray::from(vec!["^(b)", "^(d)", "(b|d)(b|d)", "(B|D)", "^(b|c)"]);
-        let ids = Int64Array::from(vec![1; 5]);
-
-        let mut expected_builder = StringViewBuilder::new();
-        expected_builder.append_null();
-        expected_builder.append_null();
-        expected_builder.append_value("d");
-        expected_builder.append_null();
-        expected_builder.append_null();
-        let expected = expected_builder.finish();
-
-        let re = regexp_extract(&[Arc::new(values), Arc::new(patterns), Arc::new(ids)])
+        let re = regexp_extract(&[Arc::new(values), Arc::new(patterns), Arc::new(idx)])
             .unwrap();
 
         assert_eq!(re.as_ref(), &expected);

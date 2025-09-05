@@ -252,10 +252,11 @@ select log(-1), log(0), sqrt(-1);
 
 ## Regular Expressions
 
-| Syntax         | Description                                                                   |
-| -------------- | ----------------------------------------------------------------------------- |
-| regexp_match   | Matches a regular expression against a string and returns matched substrings. |
-| regexp_replace | Replaces strings that match a regular expression                              |
+| Syntax         | Description                                                                        |
+| -------------- | ---------------------------------------------------------------------------------- |
+| regexp_match   | Matches a regular expression against a string and returns matched substrings.      |
+| regexp_extract | Matches a regular expression against a string and extracts a specific match group. |
+| regexp_replace | Replaces strings that match a regular expression                                   |
 
 ## Temporal Expressions
 
